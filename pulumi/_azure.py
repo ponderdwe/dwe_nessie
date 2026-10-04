@@ -1,10 +1,16 @@
 """
 DWE Nessie Infrastructure — Azure Pulumi IaC
-Provisions: PostgreSQL DB (in existing cluster) + VMSS (single instance)
+Provisions: App Gateway (HTTP→HTTPS) + VMSS + PostgreSQL DB + DNS A record
+
+Two modes:
+  - Standalone (default): creates its own App Gateway + public IP
+  - Shared LB: attaches to a common-deploy App Gateway backend pool
+    (set COMMON_APP_GW_ID + COMMON_APP_GW_PUBLIC_IP in Key Vault)
+    Pool ID is derived as {COMMON_APP_GW_ID}/backendAddressPools/nessie-pool
 
 Nessie runs on the VM as two Docker containers:
   - projectnessie/nessie  (internal, port 19120)
-  - nginx proxy           (public port 19120) — validates Bearer token
+  - nginx proxy           (port 19120) — validates Bearer token
 """
 
 import base64
@@ -48,6 +54,7 @@ volume_size          = int(config.get("volume_size") or "50")
 resource_group       = config.require("resource_group")
 subscription_id      = config.require("subscription_id")
 startup_code_version = config.get("startup_code_version") or ""
+app_port             = 19120
 
 suffix         = f"-{env}" if env != "prod" else ""
 nessie_db_name = f"nessie_{env}"
@@ -68,10 +75,24 @@ def get_secret(kv_name: str, sid: str) -> dict:
 
 secrets = get_secret(key_vault_name, secret_id)
 
-vm_subnet_id        = secrets["VM_SUBNET_ID"]
-ssh_public_key      = secrets["SSH_PUBLIC_KEY"]
-git_deploy_token    = secrets["git_deploy_token"]
-git_deploy_username = secrets.get("git_deploy_username", "x-token-auth")
+vm_subnet_id           = secrets["VM_SUBNET_ID"]
+ssh_public_key         = secrets["SSH_PUBLIC_KEY"]
+git_deploy_token       = secrets["git_deploy_token"]
+git_deploy_username    = secrets.get("git_deploy_username", "x-token-auth")
+dns_zone_name          = secrets["DNS_ZONE_NAME"]
+dns_record_name        = secrets["DNS_RECORD_NAME"]
+dns_zone_rg            = secrets.get("DNS_ZONE_RESOURCE_GROUP", resource_group)
+ssl_cert_kv_id         = secrets.get("APP_GW_SSL_CERT_KEY_VAULT_ID", "")
+
+common_app_gw_id        = secrets.get("COMMON_APP_GW_ID", "")
+common_app_gw_public_ip = secrets.get("COMMON_APP_GW_PUBLIC_IP", "")
+use_common_lb = bool(common_app_gw_id)
+
+if use_common_lb:
+    if not common_app_gw_public_ip:
+        raise ValueError("COMMON_APP_GW_PUBLIC_IP is required when COMMON_APP_GW_ID is set")
+else:
+    app_gw_subnet_id = secrets["APP_GW_SUBNET_ID"]
 
 for _key in ("NESSIE_DB_HOST", "NESSIE_DB_PASS", "NESSIE_TOKEN"):
     if not secrets.get(_key):
@@ -107,8 +128,7 @@ kv_access = azure_native.authorization.RoleAssignment(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PostgreSQL database for Nessie metadata
-# Uses import_ to adopt the DB if it already exists in Azure (idempotent).
+# PostgreSQL database — idempotent (imports if already exists)
 # ─────────────────────────────────────────────────────────────────────────────
 pg_fqdn_output = pulumi.Output.from_input(nessie_db_host)
 _server_name = nessie_db_host.split(".")[0]
@@ -138,7 +158,7 @@ pg.Database(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NSG — allow port 19120 (Nessie/nginx proxy) from internet, SSH from VNet
+# NSG — port 19120 from VirtualNetwork (covers both App GW subnet and VNet peers)
 # ─────────────────────────────────────────────────────────────────────────────
 vm_nsg = azure_native.network.NetworkSecurityGroup(
     f"{project_name}-nsg{suffix}",
@@ -149,7 +169,7 @@ vm_nsg = azure_native.network.NetworkSecurityGroup(
         azure_native.network.SecurityRuleArgs(
             name="AllowNessie",
             priority=100, direction="Inbound", access="Allow", protocol="Tcp",
-            source_port_range="*", destination_port_range="19120",
+            source_port_range="*", destination_port_range=str(app_port),
             source_address_prefix="VirtualNetwork", destination_address_prefix="*",
         ),
         azure_native.network.SecurityRuleArgs(
@@ -161,6 +181,150 @@ vm_nsg = azure_native.network.NetworkSecurityGroup(
     ],
     tags=tags,
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public IP + App Gateway (standalone mode only)
+# ─────────────────────────────────────────────────────────────────────────────
+public_ip = None
+app_gw    = None
+
+if not use_common_lb:
+    public_ip = azure_native.network.PublicIPAddress(
+        f"{project_name}-pip{suffix}",
+        resource_group_name=resource_group,
+        location=azure_location,
+        public_ip_address_name=f"{project_name}-pip{suffix}",
+        sku=azure_native.network.PublicIPAddressSkuArgs(name="Standard"),
+        public_ip_allocation_method="Static",
+        tags=tags,
+    )
+
+    app_gw_name = f"{project_name}-appgw{suffix}"
+    ag_prefix = (
+        f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.Network/applicationGateways/{app_gw_name}"
+    )
+
+    ssl_certs = []
+    if ssl_cert_kv_id:
+        ssl_certs = [azure_native.network.ApplicationGatewaySslCertificateArgs(
+            name="tls-cert",
+            key_vault_secret_id=ssl_cert_kv_id,
+        )]
+
+    has_ssl = bool(ssl_certs)
+
+    http_listeners = [
+        azure_native.network.ApplicationGatewayHttpListenerArgs(
+            name="http-listener",
+            frontend_ip_configuration=azure_native.network.SubResourceArgs(
+                id=f"{ag_prefix}/frontendIPConfigurations/appGwPublicFrontendIp"),
+            frontend_port=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/frontendPorts/port_80"),
+            protocol="Http",
+        ),
+    ]
+
+    redirect_configurations = []
+    if has_ssl:
+        http_listeners.append(azure_native.network.ApplicationGatewayHttpListenerArgs(
+            name="https-listener",
+            frontend_ip_configuration=azure_native.network.SubResourceArgs(
+                id=f"{ag_prefix}/frontendIPConfigurations/appGwPublicFrontendIp"),
+            frontend_port=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/frontendPorts/port_443"),
+            protocol="Https",
+            ssl_certificate=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/sslCertificates/tls-cert"),
+        ))
+        redirect_configurations = [azure_native.network.ApplicationGatewayRedirectConfigurationArgs(
+            name="redirect-to-https",
+            redirect_type="Permanent",
+            target_listener=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/httpListeners/https-listener"),
+            include_path=True,
+            include_query_string=True,
+        )]
+        routing_rules = [
+            azure_native.network.ApplicationGatewayRequestRoutingRuleArgs(
+                name="http-redirect",
+                priority=10, rule_type="Basic",
+                http_listener=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/httpListeners/http-listener"),
+                redirect_configuration=azure_native.network.SubResourceArgs(
+                    id=f"{ag_prefix}/redirectConfigurations/redirect-to-https"),
+            ),
+            azure_native.network.ApplicationGatewayRequestRoutingRuleArgs(
+                name="https-route",
+                priority=20, rule_type="Basic",
+                http_listener=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/httpListeners/https-listener"),
+                backend_address_pool=azure_native.network.SubResourceArgs(
+                    id=f"{ag_prefix}/backendAddressPools/backendPool"),
+                backend_http_settings=azure_native.network.SubResourceArgs(
+                    id=f"{ag_prefix}/backendHttpSettingsCollection/backendHttpSettings"),
+            ),
+        ]
+    else:
+        routing_rules = [
+            azure_native.network.ApplicationGatewayRequestRoutingRuleArgs(
+                name="http-route",
+                priority=10, rule_type="Basic",
+                http_listener=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/httpListeners/http-listener"),
+                backend_address_pool=azure_native.network.SubResourceArgs(
+                    id=f"{ag_prefix}/backendAddressPools/backendPool"),
+                backend_http_settings=azure_native.network.SubResourceArgs(
+                    id=f"{ag_prefix}/backendHttpSettingsCollection/backendHttpSettings"),
+            )
+        ]
+
+    ag_identity = identity.id.apply(lambda iid: azure_native.network.ManagedServiceIdentityArgs(
+        type="UserAssigned",
+        user_assigned_identities={iid: {}},
+    )) if has_ssl else None
+
+    app_gw = azure_native.network.ApplicationGateway(
+        app_gw_name,
+        resource_group_name=resource_group,
+        application_gateway_name=app_gw_name,
+        location=azure_location,
+        sku=azure_native.network.ApplicationGatewaySkuArgs(name="Standard_v2", tier="Standard_v2", capacity=1),
+        identity=ag_identity,
+        gateway_ip_configurations=[azure_native.network.ApplicationGatewayIPConfigurationArgs(
+            name="appGatewayIpConfig",
+            subnet=azure_native.network.SubResourceArgs(id=app_gw_subnet_id),
+        )],
+        frontend_ip_configurations=[azure_native.network.ApplicationGatewayFrontendIPConfigurationArgs(
+            name="appGwPublicFrontendIp",
+            public_ip_address=azure_native.network.SubResourceArgs(id=public_ip.id),
+        )],
+        frontend_ports=[
+            azure_native.network.ApplicationGatewayFrontendPortArgs(name="port_80", port=80),
+            azure_native.network.ApplicationGatewayFrontendPortArgs(name="port_443", port=443),
+        ],
+        backend_address_pools=[
+            azure_native.network.ApplicationGatewayBackendAddressPoolArgs(name="backendPool"),
+        ],
+        backend_http_settings_collection=[
+            azure_native.network.ApplicationGatewayBackendHttpSettingsArgs(
+                name="backendHttpSettings",
+                port=app_port, protocol="Http",
+                cookie_based_affinity="Disabled",
+                request_timeout=60,
+                probe=azure_native.network.SubResourceArgs(id=f"{ag_prefix}/probes/healthProbe"),
+            )
+        ],
+        # nginx proxy returns 401 for unauthenticated requests — treat as healthy
+        probes=[azure_native.network.ApplicationGatewayProbeArgs(
+            name="healthProbe",
+            protocol="Http", host="127.0.0.1",
+            path="/api/v1/config",
+            interval=30, timeout=10, unhealthy_threshold=3,
+            match=azure_native.network.ApplicationGatewayProbeHealthResponseMatchArgs(
+                status_codes=["200-401"],
+            ),
+        )],
+        http_listeners=http_listeners,
+        request_routing_rules=routing_rules,
+        ssl_certificates=ssl_certs,
+        redirect_configurations=redirect_configurations,
+        tags=tags,
+        opts=pulumi.ResourceOptions(depends_on=[public_ip, kv_access]),
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Startup script
@@ -216,8 +380,13 @@ echo "=== DWE Nessie bootstrap complete ==="
 nessie_custom_data = pg_fqdn_output.apply(_build_startup_script)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VMSS (single instance — Trino reaches Nessie on port 19120 via VNet private IP)
+# VMSS
 # ─────────────────────────────────────────────────────────────────────────────
+_backend_pool_id = (
+    f"{common_app_gw_id}/backendAddressPools/nessie-pool" if use_common_lb
+    else f"{ag_prefix}/backendAddressPools/backendPool"
+)
+
 vmss = azure_native.compute.VirtualMachineScaleSet(
     f"{project_name}-vmss{suffix}",
     resource_group_name=resource_group,
@@ -268,6 +437,9 @@ vmss = azure_native.compute.VirtualMachineScaleSet(
                         azure_native.compute.VirtualMachineScaleSetIPConfigurationArgs(
                             name=f"{project_name}-ipconfig{suffix}",
                             subnet=azure_native.compute.ApiEntityReferenceArgs(id=vm_subnet_id),
+                            application_gateway_backend_address_pools=[
+                                azure_native.network.SubResourceArgs(id=_backend_pool_id)
+                            ],
                         )
                     ],
                     network_security_group=azure_native.network.SubResourceArgs(id=vm_nsg.id),
@@ -277,9 +449,28 @@ vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
     tags=tags,
     opts=pulumi.ResourceOptions(
-        depends_on=[kv_access],
+        depends_on=[app_gw, kv_access] if app_gw else [kv_access],
         replace_on_changes=["virtualMachineProfile"],
         delete_before_replace=True,
+    ),
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DNS — A record pointing to App Gateway public IP
+# ─────────────────────────────────────────────────────────────────────────────
+azure_native.network.RecordSet(
+    f"{project_name}-dns{suffix}",
+    resource_group_name=dns_zone_rg,
+    zone_name=dns_zone_name,
+    relative_record_set_name=dns_record_name,
+    record_type="A",
+    ttl=30,
+    a_records=(
+        [azure_native.network.ARecordArgs(ipv4_address=common_app_gw_public_ip)]
+        if use_common_lb
+        else public_ip.ip_address.apply(
+            lambda ip: [azure_native.network.ARecordArgs(ipv4_address=ip)] if ip else []
+        )
     ),
 )
 
@@ -291,8 +482,8 @@ _kg_token    = secrets.get("KG_API_TOKEN", "")
 _kg_mappings = _dwe.get("kg_mappings") if _dwe else None
 
 if _kg_host and _kg_token and _kg_mappings:
-    import httpx as _httpx
     import warnings as _warnings
+    import httpx as _httpx
 
     _adapter_name  = _kg_mappings["adapter_name"]
     _kg_props_keys = _kg_mappings.get("kg_adapter_properties", {})
@@ -301,6 +492,8 @@ if _kg_host and _kg_token and _kg_mappings:
 
     _pulumi_export_map = {
         "vmss_name":   vmss.name,
+        "appgw_name":  app_gw.name if app_gw else pulumi.Output.from_input(""),
+        "url":         pulumi.Output.from_input(f"https://{dns_record_name}.{dns_zone_name}"),
         "environment": pulumi.Output.from_input(env),
     }
     _out_names = list(_kg_outputs.keys())
@@ -323,7 +516,9 @@ if _kg_host and _kg_token and _kg_mappings:
 # Outputs
 # ─────────────────────────────────────────────────────────────────────────────
 pulumi.export("vmss_name",   vmss.name)
+pulumi.export("url",         f"https://{dns_record_name}.{dns_zone_name}")
 pulumi.export("environment", env)
-# Retrieve the VM private IP after deploy:
-# az vmss nic list --resource-group <rg> --vmss-name <vmss_name> --query "[0].ipConfigurations[0].privateIPAddress" -o tsv
-# Then set CATALOG_URL=http://<private-ip>:19120 in the Trino secret.
+if app_gw:
+    pulumi.export("appgw_name", app_gw.name)
+if public_ip:
+    pulumi.export("public_ip",  public_ip.ip_address)
