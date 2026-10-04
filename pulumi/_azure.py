@@ -130,7 +130,7 @@ vm_nsg = azure_native.network.NetworkSecurityGroup(
             name="AllowNessie",
             priority=100, direction="Inbound", access="Allow", protocol="Tcp",
             source_port_range="*", destination_port_range="19120",
-            source_address_prefix="*", destination_address_prefix="*",
+            source_address_prefix="VirtualNetwork", destination_address_prefix="*",
         ),
         azure_native.network.SecurityRuleArgs(
             name="AllowSSH",
@@ -196,7 +196,7 @@ echo "=== DWE Nessie bootstrap complete ==="
 nessie_custom_data = pg_fqdn_output.apply(_build_startup_script)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VMSS (single instance, public IP per instance so Trino can reach port 19120)
+# VMSS (single instance — Trino reaches Nessie on port 19120 via VNet private IP)
 # ─────────────────────────────────────────────────────────────────────────────
 vmss = azure_native.compute.VirtualMachineScaleSet(
     f"{project_name}-vmss{suffix}",
@@ -248,11 +248,6 @@ vmss = azure_native.compute.VirtualMachineScaleSet(
                         azure_native.compute.VirtualMachineScaleSetIPConfigurationArgs(
                             name=f"{project_name}-ipconfig{suffix}",
                             subnet=azure_native.compute.ApiEntityReferenceArgs(id=vm_subnet_id),
-                            public_ip_address_configuration=azure_native.compute.VirtualMachineScaleSetPublicIPAddressConfigurationArgs(
-                                name=f"{project_name}-pubip{suffix}",
-                                sku=azure_native.compute.VirtualMachineScaleSetPublicIPAddressConfigurationSkuArgs(name="Standard"),
-                                public_ip_allocation_method="Static",
-                            ),
                         )
                     ],
                     network_security_group=azure_native.network.SubResourceArgs(id=vm_nsg.id),
@@ -309,6 +304,6 @@ if _kg_host and _kg_token and _kg_mappings:
 # ─────────────────────────────────────────────────────────────────────────────
 pulumi.export("vmss_name",   vmss.name)
 pulumi.export("environment", env)
-# Retrieve the VM public IP after deploy:
-# az vmss list-instance-public-ips --resource-group <rg> --name <vmss_name> --query "[0].ipAddress" -o tsv
-# Then set CATALOG_URL=http://<ip>:19120 in the Trino secret.
+# Retrieve the VM private IP after deploy:
+# az vmss nic list --resource-group <rg> --vmss-name <vmss_name> --query "[0].ipConfigurations[0].privateIPAddress" -o tsv
+# Then set CATALOG_URL=http://<private-ip>:19120 in the Trino secret.
