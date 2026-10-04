@@ -11,6 +11,7 @@ import base64
 import json
 from pathlib import Path
 
+import httpx
 import pulumi
 import pulumi_azure_native as azure_native
 import pulumi_azure_native.dbforpostgresql.v20221201 as pg
@@ -107,14 +108,33 @@ kv_access = azure_native.authorization.RoleAssignment(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PostgreSQL database for Nessie metadata
+# Uses import_ to adopt the DB if it already exists in Azure (idempotent).
 # ─────────────────────────────────────────────────────────────────────────────
 pg_fqdn_output = pulumi.Output.from_input(nessie_db_host)
+_server_name = nessie_db_host.split(".")[0]
+_db_res_id = (
+    f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
+    f"/providers/Microsoft.DBforPostgreSQL/flexibleServers/{_server_name}/databases/{nessie_db_name}"
+)
+
+def _db_import_id() -> "str | None":
+    try:
+        token = DefaultAzureCredential().get_token("https://management.azure.com/.default").token
+        resp = httpx.get(
+            f"https://management.azure.com{_db_res_id}?api-version=2022-12-01",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        return _db_res_id if resp.status_code == 200 else None
+    except Exception:
+        return None
+
 pg.Database(
     f"{project_name}-pg-db{suffix}",
     resource_group_name=resource_group,
-    server_name=nessie_db_host.split(".")[0],
+    server_name=_server_name,
     database_name=nessie_db_name,
-    opts=pulumi.ResourceOptions(depends_on=[kv_access]),
+    opts=pulumi.ResourceOptions(depends_on=[kv_access], import_=_db_import_id()),
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
