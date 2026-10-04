@@ -1,15 +1,8 @@
-map_hash_bucket_size 256;
-
-map $http_authorization $auth_ok {
-    default           0;
-    "Bearer ${NESSIE_TOKEN}" 1;
-}
-
 server {
     listen 19120;
 
     location / {
-        if ($auth_ok = 0) {
+        if ($http_authorization != "Bearer ${NESSIE_TOKEN}") {
             return 401;
         }
 
