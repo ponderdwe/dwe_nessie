@@ -364,9 +364,7 @@ git -C /home/ubuntu/nessie checkout {git_branch}
 
 echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/nessie/.env
 chmod 600 /home/ubuntu/nessie/.env
-echo "QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://{pg_fqdn}:5432/{nessie_db_name}" >> /home/ubuntu/nessie/.env
-echo "QUARKUS_DATASOURCE_USERNAME={nessie_db_user}" >> /home/ubuntu/nessie/.env
-echo "QUARKUS_DATASOURCE_PASSWORD=$NESSIE_DB_PASS" >> /home/ubuntu/nessie/.env
+echo "NESSIE_DB_NAME={nessie_db_name}" >> /home/ubuntu/nessie/.env
 
 chmod +x /home/ubuntu/nessie/nginx/entrypoint.sh
 
