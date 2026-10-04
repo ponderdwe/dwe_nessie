@@ -1,0 +1,193 @@
+_dwe_hub:
+  hub_name: nessie
+  display_name: "Nessie Iceberg Catalog"
+  description: "Project Nessie catalog server with PostgreSQL backend and Bearer token authentication"
+  icon: "table"
+  git_providers:
+    - github
+    - gitlab
+  cloud_providers:
+    - azure
+    - aws
+  services:
+    - name: Nessie
+      description: "Nessie REST API on port 19120 (Bearer token protected)"
+  depends_on: []
+  kg_pulumi_outputs:
+    vmss_name: vmss_name
+    asg_name: asg_name
+  ci_templates:
+    github: ci-templates/github.yaml
+    gitlab: ci-templates/gitlab.yaml
+  required_secrets:
+    # ── CI secrets: Azure ──────────────────────────────────────────────────────
+    - key: AZURE_CLIENT_ID
+      description: "Service principal client ID"
+      destination: ci
+      cloud_provider: azure
+    - key: AZURE_CLIENT_SECRET
+      description: "Service principal client secret"
+      destination: ci
+      cloud_provider: azure
+    - key: AZURE_TENANT_ID
+      description: "Azure AD tenant ID"
+      destination: ci
+      cloud_provider: azure
+    - key: AZURE_SUBSCRIPTION_ID
+      description: "Azure subscription ID"
+      destination: ci
+      cloud_provider: azure
+    - key: AZURE_STORAGE_ACCOUNT
+      description: "Storage account name for Pulumi state backend"
+      destination: ci
+      cloud_provider: azure
+    - key: PULUMI_AZURE_STATE
+      description: "Azure Blob Storage URL for Pulumi state, e.g. azblob://deploy-state/nessie-state"
+      destination: ci
+      cloud_provider: azure
+    - key: RESOURCE_GROUP
+      description: "Azure resource group name"
+      destination: ci
+      cloud_provider: azure
+    - key: KEY_VAULT_NAME
+      description: "Azure Key Vault holding the DWE_DEPLOY_NESSIE secret"
+      destination: ci
+      cloud_provider: azure
+    # ── CI secrets: AWS ────────────────────────────────────────────────────────
+    - key: AWS_ACCESS_KEY_ID
+      description: "AWS access key for Pulumi"
+      destination: ci
+      cloud_provider: aws
+    - key: AWS_SECRET_ACCESS_KEY
+      description: "AWS secret key for Pulumi"
+      destination: ci
+      cloud_provider: aws
+    - key: PULUMI_S3_STATE
+      description: "S3 URL for Pulumi state backend, e.g. s3://my-pulumi-state-bucket"
+      destination: ci
+      cloud_provider: aws
+    # ── Secrets Manager / Key Vault: DWE_DEPLOY_NESSIE ────────────────────────
+    - key: VM_SUBNET_ID
+      description: "Subnet ID for the Nessie VM (Azure)"
+      destination: secrets_manager
+      cloud_provider: azure
+    - key: VPC_ID
+      description: "VPC ID for the Nessie EC2 instance (AWS)"
+      destination: secrets_manager
+      cloud_provider: aws
+    - key: SUBNET_IDS
+      description: "JSON array of subnet IDs, e.g. [\"subnet-abc\",\"subnet-def\"] (AWS)"
+      destination: secrets_manager
+      cloud_provider: aws
+    - key: SSH_PUBLIC_KEY
+      description: "SSH public key for VM access"
+      destination: secrets_manager
+    - key: git_deploy_token
+      description: "Git token for repo clone on VM boot"
+      destination: secrets_manager
+    - key: NESSIE_DB_HOST
+      description: "PostgreSQL hostname for Nessie metadata (e.g. myserver.postgres.database.azure.com)"
+      destination: secrets_manager
+    - key: NESSIE_DB_PASS
+      description: "PostgreSQL password for Nessie"
+      destination: secrets_manager
+    - key: NESSIE_TOKEN
+      description: "Bearer token for Nessie API access (generate with: openssl rand -hex 32)"
+      destination: secrets_manager
+  optional_secrets:
+    - key: NESSIE_DB_USER
+      description: "PostgreSQL username for Nessie (defaults to 'nessie')"
+      destination: secrets_manager
+    - key: git_deploy_username
+      description: "Git username for HTTPS clone (defaults to x-token-auth)"
+      destination: secrets_manager
+    - key: KEY_NAME
+      description: "EC2 key pair name for SSH access (AWS)"
+      destination: secrets_manager
+      cloud_provider: aws
+    - key: KG_API_HOST
+      description: "Deploy Management API host"
+      destination: secrets_manager
+    - key: KG_API_TOKEN
+      description: "Bearer token for Deploy Management API"
+      destination: secrets_manager
+
+_templates_suffix: .jinja
+
+_exclude:
+  - copier.yml
+  - README.md
+  - .git
+  - .env
+  - __pycache__
+  - "*.pyc"
+  - "*.pyo"
+  - "pulumi/dwe-hydration.yaml"
+
+_skip_if_exists:
+  - .env.example
+
+project_name:
+  type: str
+  help: "Client project slug for cloud resource naming (lowercase, hyphens)"
+  validator: "{% if not (project_name | regex_search('^[a-z][a-z0-9-]+$')) %}Must be lowercase letters, numbers, hyphens{% endif %}"
+
+git_repo_url:
+  type: str
+  default: ""
+  when: false
+
+adapter_name:
+  type: str
+  default: dwe_nessie
+  when: false
+
+adapter_version:
+  type: str
+  default: v1.0.0
+  when: false
+
+environments:
+  type: yaml
+  default: "[dev, prod]"
+  help: "List of deployment environments"
+
+cloud_provider:
+  type: str
+  default: azure
+  choices:
+    - azure
+    - aws
+  when: false
+
+azure_location:
+  type: str
+  default: eastus
+  when: false
+
+aws_region:
+  type: str
+  default: us-east-1
+  x_dwe_editable: true
+  x_dwe_per_env: false
+
+instance_type:
+  type: str
+  default: Standard_B2s
+  help: "VM size. Nessie is lightweight — Standard_B2s (2 vCPU, 4 GB) is sufficient."
+  x_dwe_editable: true
+  x_dwe_per_env: true
+
+volume_size:
+  type: int
+  default: 50
+  help: "Root volume size in GB."
+  x_dwe_editable: true
+  x_dwe_per_env: true
+
+secret_id:
+  type: str
+  default: "DWE_DEPLOY_NESSIE"
+  help: "Secret name in Azure Key Vault / AWS Secrets Manager holding all runtime credentials."
+  x_dwe_editable: true
+  x_dwe_per_env: false

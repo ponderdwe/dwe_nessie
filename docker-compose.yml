@@ -1,0 +1,40 @@
+services:
+  nessie:
+    image: projectnessie/nessie:latest
+    container_name: nessie
+    restart: unless-stopped
+    environment:
+      - QUARKUS_DATASOURCE_JDBC_URL
+      - QUARKUS_DATASOURCE_USERNAME
+      - QUARKUS_DATASOURCE_PASSWORD
+      - NESSIE_VERSION_STORE_TYPE=JDBC
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:19120/api/v2/config || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - nessie-internal
+
+  nessie-proxy:
+    image: nginx:alpine
+    container_name: nessie-proxy
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    ports:
+      - "19120:19120"
+    volumes:
+      - ./nginx/nessie.conf.template:/etc/nginx/templates/nessie.conf.template:ro
+      - ./nginx/entrypoint.sh:/entrypoint.sh:ro
+    environment:
+      - NESSIE_TOKEN
+    depends_on:
+      nessie:
+        condition: service_healthy
+    networks:
+      - nessie-internal
+
+networks:
+  nessie-internal:
+    driver: bridge

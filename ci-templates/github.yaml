@@ -1,0 +1,277 @@
+# GitHub Actions — two-path deploy for branch {@ ENV_NAME @} → workspace {@ WORKSPACE_NAME @}
+#
+# Path 1 — pulumi/** changed   → pulumi preview (PR) or pulumi up (push)
+# Path 2 — app files changed,  → reimage VM / ASG instance refresh
+#           pulumi NOT changed
+
+name: Deploy — {@ ENV_NAME @}
+
+on:
+  push:
+    branches: ["{@ ENV_NAME @}"]
+  pull_request:
+    branches: ["{@ ENV_NAME @}"]
+
+env:
+  WORKSPACE: {@ WORKSPACE_NAME @}
+  SM_SECRET: {@ SECRET_NAME @}
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.filter.outputs.infra }}
+      app: ${{ steps.filter.outputs.app }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          token: ""
+          filters: |
+            infra:
+              - 'pulumi/**'
+            app:
+              - '**'
+              - '!pulumi/**'
+
+  # ── PR: preview infra changes ──────────────────────────────────────────────
+  pulumi-preview:
+    needs: detect-changes
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Pulumi CLI
+        run: curl -fsSL https://get.pulumi.com | sh && echo "$HOME/.pulumi/bin" >> $GITHUB_PATH
+{% if CLOUD_PROVIDER == "azure" %}
+      - uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}"}'
+      - name: Init stack and set config
+        run: |
+          pulumi stack select ${{ env.WORKSPACE }} 2>/dev/null || pulumi stack init ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:environment ${{ env.WORKSPACE }} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:git_branch {@ ENV_NAME @} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:secret_id ${{ env.SM_SECRET }} --stack ${{ env.WORKSPACE }} --plaintext
+          pulumi config set {@ PROJECT_NAME @}:key_vault_name ${{ secrets.KEY_VAULT_NAME }} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:resource_group ${{ secrets.RESOURCE_GROUP }} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:subscription_id ${{ secrets.AZURE_SUBSCRIPTION_ID }} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:cloud_provider azure --stack ${{ env.WORKSPACE }}
+        working-directory: pulumi
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_AZURE_STATE }}
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+      - uses: pulumi/actions@v5
+        with:
+          command: preview
+          stack-name: ${{ env.WORKSPACE }}
+          work-dir: pulumi
+          cloud-url: ${{ secrets.PULUMI_AZURE_STATE }}
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+{% else %}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: {@ AWS_REGION @}
+      - name: Init stack if needed
+        run: |
+          pulumi stack select ${{ env.WORKSPACE }} 2>/dev/null || pulumi stack init ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:cloud_provider aws --stack ${{ env.WORKSPACE }}
+        working-directory: pulumi
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+      - uses: pulumi/actions@v5
+        with:
+          command: preview
+          stack-name: ${{ env.WORKSPACE }}
+          work-dir: pulumi
+          cloud-url: ${{ secrets.PULUMI_S3_STATE }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: {@ AWS_REGION @}
+          PULUMI_CONFIG_PASSPHRASE: ""
+{% endif %}
+
+  # ── Push: apply infra changes ──────────────────────────────────────────────
+  pulumi-apply:
+    needs: detect-changes
+    if: github.event_name == 'push' && needs.detect-changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Pulumi CLI
+        run: curl -fsSL https://get.pulumi.com | sh && echo "$HOME/.pulumi/bin" >> $GITHUB_PATH
+{% if CLOUD_PROVIDER == "azure" %}
+      - uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}"}'
+      - name: Pulumi login
+        run: pulumi login ${{ secrets.PULUMI_AZURE_STATE }}
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+      - name: Init stack and set config
+        run: |
+          pulumi stack select ${{ env.WORKSPACE }} 2>/dev/null || pulumi stack init ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:environment ${{ env.WORKSPACE }} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:git_branch {@ ENV_NAME @} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:secret_id ${{ env.SM_SECRET }} --stack ${{ env.WORKSPACE }} --plaintext
+          pulumi config set {@ PROJECT_NAME @}:key_vault_name ${{ secrets.KEY_VAULT_NAME }} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:resource_group ${{ secrets.RESOURCE_GROUP }} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:subscription_id ${{ secrets.AZURE_SUBSCRIPTION_ID }} --stack ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:cloud_provider azure --stack ${{ env.WORKSPACE }}
+          pulumi config set startup_code_version "${{ github.sha }}" --stack ${{ env.WORKSPACE }}
+          pulumi up --yes --stack ${{ env.WORKSPACE }}
+        working-directory: pulumi
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_AZURE_STATE }}
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+      - uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}"}'
+      - name: Reimage VMSS and wait
+        run: |
+          VMSS_NAME=$(az vmss list --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --query "[?tags.Project=='{@ PROJECT_NAME @}' && tags.Environment=='{@ WORKSPACE_NAME @}' && tags.ManagedBy=='Pulumi'].name | [0]" -o tsv)
+          echo "Reimaging VMSS: $VMSS_NAME"
+          az vmss update-instances --resource-group ${{ secrets.RESOURCE_GROUP }} --name $VMSS_NAME --instance-ids '*' --no-wait || true
+          for i in $(seq 1 40); do
+            STATUS=$(az vmss list-instances --resource-group ${{ secrets.RESOURCE_GROUP }} --name $VMSS_NAME \
+              --query "[0].provisioningState" -o tsv 2>/dev/null || echo "Unknown")
+            echo "  [$i/40] $STATUS"
+            case "$STATUS" in
+              Succeeded) echo "VMSS instance ready."; break ;;
+              Failed) echo "VMSS instance failed"; exit 1 ;;
+            esac
+            [ "$i" -eq 40 ] && { echo "Timeout waiting for VMSS instance"; exit 1; }
+            sleep 30
+          done
+{% else %}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: {@ AWS_REGION @}
+      - name: Pulumi login
+        run: pulumi login $PULUMI_BACKEND_URL
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+      - name: Bump startup_code_version and deploy
+        run: |
+          cd pulumi
+          pulumi stack select ${{ env.WORKSPACE }} 2>/dev/null || pulumi stack init ${{ env.WORKSPACE }}
+          pulumi config set {@ PROJECT_NAME @}:cloud_provider aws --stack ${{ env.WORKSPACE }}
+          pulumi config set startup_code_version "${{ github.sha }}" --stack ${{ env.WORKSPACE }}
+          pulumi up --yes --stack ${{ env.WORKSPACE }}
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+      - name: Start and wait for ASG instance refresh
+        run: |
+          ASG_NAME=$(cd pulumi && pulumi stack output asg_name --stack ${{ env.WORKSPACE }})
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' 2>&1 || true
+          for i in $(seq 1 40); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            echo "  [$i/40] $STATUS"
+            case "$STATUS" in
+              Successful) echo "Instance refresh completed."; break ;;
+              Failed|Cancelled) echo "Instance refresh $STATUS"; exit 1 ;;
+            esac
+            [ "$i" -eq 40 ] && { echo "Timeout"; exit 1; }
+            sleep 30
+          done
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+{% endif %}
+
+  # ── Push: redeploy app when only app files changed ─────────────────────────
+  deploy-app:
+    needs: detect-changes
+    if: >
+      github.event_name == 'push' &&
+      needs.detect-changes.outputs.app == 'true' &&
+      needs.detect-changes.outputs.infra != 'true'
+    runs-on: ubuntu-latest
+    steps:
+{% if CLOUD_PROVIDER == "azure" %}
+      - uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}"}'
+      - name: Reimage VMSS
+        run: |
+          VMSS_NAME=$(az vmss list --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --query "[?tags.Project=='{@ PROJECT_NAME @}' && tags.Environment=='{@ WORKSPACE_NAME @}' && tags.ManagedBy=='Pulumi'].name | [0]" -o tsv)
+          az vmss update-instances --resource-group ${{ secrets.RESOURCE_GROUP }} --name $VMSS_NAME --instance-ids '*' --no-wait || true
+          for i in $(seq 1 40); do
+            STATUS=$(az vmss list-instances --resource-group ${{ secrets.RESOURCE_GROUP }} --name $VMSS_NAME \
+              --query "[0].provisioningState" -o tsv 2>/dev/null || echo "Unknown")
+            echo "  [$i/40] $STATUS"
+            case "$STATUS" in
+              Succeeded) echo "VMSS instance ready."; break ;;
+              Failed) echo "VMSS instance failed"; exit 1 ;;
+            esac
+            [ "$i" -eq 40 ] && { echo "Timeout"; exit 1; }
+            sleep 30
+          done
+{% else %}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: {@ AWS_REGION @}
+      - name: ASG instance refresh
+        run: |
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --filters \
+              "Name=tag:Project,Values={@ PROJECT_NAME @}" \
+              "Name=tag:Environment,Values={@ WORKSPACE_NAME @}" \
+              "Name=tag:ManagedBy,Values=Pulumi" \
+            --query "AutoScalingGroups[0].AutoScalingGroupName" --output text)
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' 2>&1 || true
+          for i in $(seq 1 40); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            echo "  [$i/40] $STATUS"
+            case "$STATUS" in
+              Successful) echo "Instance refresh completed."; break ;;
+              Failed|Cancelled) echo "Instance refresh $STATUS"; exit 1 ;;
+            esac
+            [ "$i" -eq 40 ] && { echo "Timeout"; exit 1; }
+            sleep 30
+          done
+{% endif %}

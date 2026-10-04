@@ -1,0 +1,11 @@
+config:
+  {{ project_name }}:environment: prod
+  {{ project_name }}:git_branch: main
+  {{ project_name }}:secret_id: {{ secret_id }}
+  {{ project_name }}:instance_type: {{ instance_type }}
+  {{ project_name }}:volume_size: "{{ volume_size }}"
+{% if cloud_provider == "azure" %}
+  {{ project_name }}:azure_location: {{ azure_location }}
+{% else %}
+  {{ project_name }}:aws_region: {{ aws_region }}
+{% endif %}

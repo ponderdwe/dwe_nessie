@@ -1,0 +1,11 @@
+pulumi>=3.0.0,<4.0.0
+{% if cloud_provider == "azure" %}
+pulumi-azure-native>=2.0.0,<3.0.0
+azure-keyvault-secrets>=4.7.0
+azure-identity>=1.15.0
+{% else %}
+pulumi-aws>=7.0.0,<8.0.0
+boto3>=1.28.0
+{% endif %}
+pyyaml>=6.0
+httpx>=0.27.0

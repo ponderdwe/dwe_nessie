@@ -1,0 +1,10 @@
+name: {{ project_name }}
+description: DWE Nessie Iceberg Catalog for {{ project_name }}
+runtime:
+  name: python
+  options:
+    virtualenv: venv
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: dwe-nessie
