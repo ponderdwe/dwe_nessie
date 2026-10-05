@@ -19,10 +19,17 @@ services:
 
   nessie:
     environment:
-      NESSIE_DB_HOST: postgres
-      NESSIE_DB_USER: nessie
-      NESSIE_DB_PASS: nessie
-      NESSIE_DB_NAME: nessie
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/nessie
+      QUARKUS_DATASOURCE_USERNAME: nessie
+      QUARKUS_DATASOURCE_PASSWORD: nessie
+      # Local dev warehouse via MinIO (swap for ADLS vars in prod)
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES__WAREHOUSE__LOCATION: s3://warehouse/
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT__OPTIONS_ENDPOINT: http://localhost:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT__OPTIONS_PATH__STYLE__ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT__OPTIONS_ACCESS__KEY__ID: minioadmin
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT__OPTIONS_SECRET__ACCESS__KEY: minioadmin
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT__OPTIONS_REGION: us-east-1
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,6 +1,6 @@
 services:
   nessie:
-    image: projectnessie/nessie:latest
+    image: ghcr.io/projectnessie/nessie:latest
     container_name: nessie
     restart: unless-stopped
     environment:
@@ -8,6 +8,12 @@ services:
       - QUARKUS_DATASOURCE_USERNAME=${NESSIE_DB_USER}
       - QUARKUS_DATASOURCE_PASSWORD=${NESSIE_DB_PASS}
       - NESSIE_VERSION_STORE_TYPE=JDBC
+      # Iceberg REST catalog warehouse (ADLS Gen2)
+      - NESSIE_CATALOG_DEFAULT_WAREHOUSE=warehouse
+      - NESSIE_CATALOG_WAREHOUSES__WAREHOUSE__LOCATION=${ICEBERG_WAREHOUSE_DIR}
+      - NESSIE_CATALOG_SERVICE_ADLS_DEFAULT__OPTIONS_AUTH__TYPE=STORAGE_SAS_TOKEN
+      - NESSIE_CATALOG_SERVICE_ADLS_DEFAULT__OPTIONS_ACCOUNT__NAME=${AZURE_STORAGE_ACCOUNT}
+      - NESSIE_CATALOG_SERVICE_ADLS_DEFAULT__OPTIONS_ACCOUNT__KEY=${AZURE_STORAGE_KEY}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:19120/api/v2/config || exit 1"]
       interval: 15s

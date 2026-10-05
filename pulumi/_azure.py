@@ -158,6 +158,35 @@ pg.Database(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Azure Storage Account + Blob Container (Iceberg warehouse, ADLS Gen2)
+# ─────────────────────────────────────────────────────────────────────────────
+sa_env_suffix        = env if env != "prod" else ""
+storage_account_name = (project_name.replace("-", "") + sa_env_suffix)[:24]
+
+storage_account = azure_native.storage.StorageAccount(
+    f"{project_name}-sa{suffix}",
+    resource_group_name=resource_group,
+    account_name=storage_account_name,
+    location=azure_location,
+    sku=azure_native.storage.SkuArgs(name="Standard_LRS"),
+    kind="StorageV2",
+    is_hns_enabled=True,
+    tags=tags,
+)
+
+azure_native.storage.BlobContainer(
+    f"{project_name}-warehouse{suffix}",
+    resource_group_name=resource_group,
+    account_name=storage_account.name,
+    container_name="warehouse",
+)
+
+storage_key = azure_native.storage.list_storage_account_keys_output(
+    resource_group_name=resource_group,
+    account_name=storage_account.name,
+).apply(lambda r: r.keys[0].value)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # NSG — port 19120 from VirtualNetwork (covers both App GW subnet and VNet peers)
 # ─────────────────────────────────────────────────────────────────────────────
 vm_nsg = azure_native.network.NetworkSecurityGroup(
@@ -447,7 +476,7 @@ vmss = azure_native.compute.VirtualMachineScaleSet(
     ),
     tags=tags,
     opts=pulumi.ResourceOptions(
-        depends_on=[app_gw, kv_access] if app_gw else [kv_access],
+        depends_on=[app_gw, kv_access, storage_account] if app_gw else [kv_access, storage_account],
         replace_on_changes=["virtualMachineProfile"],
         delete_before_replace=True,
     ),
@@ -513,9 +542,11 @@ if _kg_host and _kg_token and _kg_mappings:
 # ─────────────────────────────────────────────────────────────────────────────
 # Outputs
 # ─────────────────────────────────────────────────────────────────────────────
-pulumi.export("vmss_name",   vmss.name)
-pulumi.export("url",         f"https://{dns_record_name}.{dns_zone_name}")
-pulumi.export("environment", env)
+pulumi.export("vmss_name",            vmss.name)
+pulumi.export("url",                  f"https://{dns_record_name}.{dns_zone_name}")
+pulumi.export("environment",          env)
+pulumi.export("storage_account_name", storage_account.name)
+pulumi.export("storage_account_key",  pulumi.Output.secret(storage_key))
 if app_gw:
     pulumi.export("appgw_name", app_gw.name)
 if public_ip:
