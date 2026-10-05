@@ -1,6 +1,6 @@
 services:
   nessie:
-    image: ghcr.io/projectnessie/nessie:latest
+    image: ghcr.io/projectnessie/nessie:0.108.8
     container_name: nessie
     restart: unless-stopped
     environment:

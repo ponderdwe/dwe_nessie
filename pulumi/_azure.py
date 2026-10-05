@@ -358,7 +358,8 @@ if not use_common_lb:
 # ─────────────────────────────────────────────────────────────────────────────
 # Startup script
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_startup_script(pg_fqdn: str) -> str:
+def _build_startup_script(pg_fqdn: str, sa_name: str, sa_key: str) -> str:
+    iceberg_warehouse_dir = f"abfs://warehouse@{sa_name}.dfs.core.windows.net/"
     script = f"""#!/bin/bash
 set -e
 exec > >(tee /var/log/nessie-init.log | logger -t nessie-init) 2>&1
@@ -384,7 +385,6 @@ az login --identity
 SECRET_JSON=$(az keyvault secret show --vault-name {key_vault_name} --name {secret_id} --query value -o tsv)
 GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
 GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
-NESSIE_DB_PASS=$(echo "$SECRET_JSON" | jq -r '.NESSIE_DB_PASS')
 
 REPO_URL="{git_repo_url}"
 REPO_PATH=$(echo "$REPO_URL" | sed 's,https://,,')
@@ -394,6 +394,9 @@ git -C /home/ubuntu/nessie checkout {git_branch}
 echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > /home/ubuntu/nessie/.env
 chmod 600 /home/ubuntu/nessie/.env
 echo "NESSIE_DB_NAME={nessie_db_name}" >> /home/ubuntu/nessie/.env
+echo "AZURE_STORAGE_ACCOUNT={sa_name}" >> /home/ubuntu/nessie/.env
+echo "AZURE_STORAGE_KEY={sa_key}" >> /home/ubuntu/nessie/.env
+echo "ICEBERG_WAREHOUSE_DIR={iceberg_warehouse_dir}" >> /home/ubuntu/nessie/.env
 
 chmod +x /home/ubuntu/nessie/nginx/entrypoint.sh
 
@@ -404,7 +407,11 @@ echo "=== DWE Nessie bootstrap complete ==="
 """
     return base64.b64encode(script.encode()).decode()
 
-nessie_custom_data = pg_fqdn_output.apply(_build_startup_script)
+nessie_custom_data = pulumi.Output.all(
+    pg_fqdn_output,
+    storage_account.name,
+    storage_key,
+).apply(lambda args: _build_startup_script(*args))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VMSS
