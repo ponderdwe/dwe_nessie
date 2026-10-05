@@ -1,5 +1,6 @@
 server {
     listen 19120;
+    merge_slashes off;
 
     # Health check endpoint — unauthenticated (read-only config)
     location = /api/v1/config {
